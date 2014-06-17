@@ -1,0 +1,440 @@
+#!/usr/bin/python
+# cdev-udevd -- A device management/hotplug daemon for container environments. [Container Component]
+#
+# Copyright (c) 2014 Taeyeon Mori
+# All rights reserved.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+import os
+import asyncio
+import logging
+import signal
+import socket
+import argparse
+import stat
+import pwd, grp
+import errno
+
+logger = logging.getLogger("cdev.udevd")
+
+from cdev import protocol as proto
+import cdev.device
+import cdev.netlink
+import cdev.async
+import cdev.client_rules
+import cdev.udevcontrol
+
+
+class CdevControl(cdev.udevcontrol.UdevControl):
+    """
+    Handle udev control messages
+    """
+
+    @classmethod
+    def new(cls, udevd, fd=-1):
+        self = super().new_from_fd(fd)
+        self.udevd = udevd
+        return self
+
+    logger = logger.getChild("control")
+
+    def handle_msg(self, msg):
+        if msg.type == cdev.udevcontrol.UDEV_CTRL_SET_LOG_LEVEL:
+            self.logger.warn("Got SET_LOG_LEVEL %i, ignored" % msg.intval)
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_STOP_EXEC_QUEUE:
+            self.logger.warn("Got STOP_EXEC_QUEUE, ignored")
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_START_EXEC_QUEUE:
+            self.logger.warn("Got START_EXEC_QUEUE, ignored")
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_RELOAD:
+            self.udevd.reload()
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_SET_ENV:
+            self.logger.warn("Got SET_ENV \"%s\", ignoring" % msg.buf)
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_SET_CHILDREN_MAX:
+            self.logger.debug("Got SET_CHILDREN_MAX %i, ignoring (not applicable)", msg.intval)
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_PING:
+            self.logger.info("Got PING.")
+        elif msg.type == cdev.udevcontrol.UDEV_CTRL_EXIT:
+            self.logger.info("Got EXIT, shutting down")
+            self.result = "udevadm exit"
+            self.udevd.future.set_result("udevadm exit")
+        else:
+            self.logger.warn("Got unknown message type %i" % msg.type)
+
+
+class CdevUdevd:
+    def __init__(self, options):
+        self.task = None
+        self.future = asyncio.Future()
+
+        self.options = options
+        self.rules = None
+
+        self.reader = None
+        self.writer = None
+        self.netlink = None
+
+    def start(self):
+        self.task = asyncio.Task(self.run())
+        self.task.add_done_callback(self.done)
+        return self.task
+
+    def done(self, task):
+        self.writer.close()
+
+    def send(self, command, data=b'', type=cdev.protocol.D_DATA, fmt=None):
+        cdev.protocol.Message(command, type, data, fmt).write_to(self.writer)
+
+    def recv(self, timeout=None):
+        if timeout is not None:
+            return cdev.async.recv_message_timeout(self.reader, timeout)
+        else:
+            return cdev.async.recv_message(self.reader)
+
+    def load_rules(self):
+        self.rules = load_rules(self.options.rules_dir)
+
+    def reload(self):
+        """
+        reload from udevadm
+        """
+        self.load_rules()
+
+    @asyncio.coroutine
+    def run(self):
+        """
+        CDEV client daemon
+        """
+        # Connect to host daemon
+        logger.info("Connecting to %s" % self.options.socket_path)
+        self.reader, self.writer = yield from asyncio.open_unix_connection(self.options.socket_path)
+
+        # Host daemon should greet us first
+        logger.debug("Waiting for server to greet us...")
+        message = yield from self.recv(timeout=10.0)
+        if message is None:
+            logger.error("Didn't receive a HELLO from server. closing connection")
+            self.send(b"bye")
+            return
+
+        # Greet back
+        logger.info("Greeting server with our name: %s" % self.options.name)
+        self.send(b"hello", self.options.name.encode())
+
+        if self.options.dry:
+            self.send(b"dry_run")
+
+        # Load rules
+        self.load_rules()
+
+        # open netlink socket to broadcast events
+        self.netlink = cdev.netlink.open_netlink(cdev.socket.NETLINK_KOBJECT_UEVENT, 0)
+        self.netlink.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+
+        # Request initial synchronisation
+        if self.options.boot or self.options.boot_only:
+            logger.info("Requesting intial boot info from host daemon...")
+            self.send(b"boot")
+        elif self.options.shutdown:
+            logger.info("Requesting shutdown data...")
+            self.send(b"shutdown")
+
+        # Listen for host events
+        msg_task = asyncio.Task(self.recv())
+        while True:
+            done, pending = yield from asyncio.wait((msg_task, self.future), return_when=asyncio.FIRST_COMPLETED)
+
+            if self.future in done:
+                for task in pending:
+                    task.cancel()
+                break
+
+            msg_task = asyncio.Task(self.recv())
+            msg = done.pop().result() # only one left
+
+            if msg.command == b"UEVENT":
+                event = cdev.netlink.UdevNetlinkMessage.parse(msg.data)
+
+                logger.debug("UEVENT: %s@%s" % (event.get_action(), event["DEVPATH"]))
+
+                device = event.make_device()
+
+                # run rules
+                context = cdev.client_rules.Context(device, event.get_action())
+                for ruleset in self.rules:
+                    try:
+                        ruleset(context)
+                    except:
+                        logger.exception("Exception evaluating ruleset: %s" % ruleset.fname)
+
+                # Write back changes
+                if not self.options.dry:
+                    for dev in context.modified_devices:
+                        dev.flush_db()
+
+                # Create device node and links
+                self.handle_device_creation(context)
+
+                # Send out the event on netlink
+                try:
+                    # FIXME: check if msg.data has everything it needs.
+                    self.netlink.sendmsg((msg.data,), (), 0, (0, cdev.netlink.UDEV_NETLINK_UDEV))
+                except OSError as e:
+                    if e.errno != errno.ECONNREFUSED: # ECONNREFUSED is expected, because we don't want to send a unicast message.
+                        raise
+
+            elif msg.command == b"FWD_ENV":
+                devpath, env_buffer = msg.data.split(b'\0', 1)
+                devpath = devpath.decode()
+                logger.info("Receiving environment for %s" % devpath)
+
+                device = cdev.device.Device.from_devpath_or_registry(devpath)
+                if not self.options.dry:
+                    device.store_new_env_buffer(env_buffer)
+
+                # device will be gc'd :P
+
+            elif msg.command == b"BYE":
+                logger.warn("Host daemon closed the connection: %s" % msg.data.decode())
+                self.send(b"bye")
+                return msg.data.decode()
+
+                #elif message.command == b"POPULATEDB":
+                #    id_fn, db_content = message.data
+                #    logger.debug("POPULATEDB %s" % id_fn)
+                #    path = os.path.join(cdev.device.RUNTIME_DATA_PATH, id_fn)
+                #    with open(path, "wb") as db:
+                #        db.write(db_content)
+
+            elif msg.command == b"ENDCMD":
+                if self.options.boot_only or self.options.shutdown:
+                    self.future.set_result("%s done" % msg.data.decode())
+                logger.info("Done %sing" % msg.data.decode())
+
+            elif msg.command == b"BEGINCMD":
+                pass
+
+            elif msge.command == b"ECHO":
+                logger.info("Got echo: %s" % msg.data)
+
+            else:
+                logger.error("Unknown command: %s" % msg.command)
+
+        logger.warn("Deamon was asked to terminate: %s" % self.future.result())
+        self.send(b"bye", self.future.result().encode())
+
+    def handle_device_creation(self, context):
+        # Create device nodes
+        device = context.device
+        node = device.devnode
+        devnum = device.get_devnum()
+        is_block = device.subsystem == "block"
+
+        if node and os.major(devnum) != 0 and not self.options.dry:
+            path = os.path.join(cdev.device.DEV_PATH, node)
+
+            if context.action == "add":
+                mode = context.mode or device.devnode_mode or 0o660
+                user = context.user or device["USER"]
+                group = context.group or device["GROUP"]
+
+                uid = gid = 0
+
+                if user:
+                    try:
+                        uid = pwd.getpwnam(user).pw_uid
+                    except KeyError:
+                        logger.error("User %s doesn't exist" % user)
+
+                if group:
+                    try:
+                        gid = grp.getgrnam(group).gr_gid
+                    except KeyError:
+                        logger.error("User %s doesn't exist" % user)
+
+                logger.debug("Creating device node for %s at %s (%s %s:%s)" % (format_device_node(devnum, is_block), path, oct(mode), user or "root", group or "root"))
+
+                dirname = os.path.dirname(path)
+                if not os.path.exists(dirname):
+                    logger.debug("Created parent directories %s" % dirname)
+                    os.makedirs(dirname)
+
+                if os.path.exists(path):
+                    logger.error("Device node already exists: %s" % path)
+
+                else:
+                    os.mknod(path, mode | (stat.S_IFBLK if type == 'b' else stat.S_IFCHR), devnum)
+                    os.chown(path, uid, gid)
+                    os.chmod(path, mode)
+
+                # Create symlinks
+                for devlink in device.get_devlinks():
+                    linkpath = os.path.join(cdev.device.DEV_PATH, devlink)
+
+                    dirname = os.path.dirname(linkpath)
+                    if not os.path.exists(dirname):
+                        logger.debug("Created parent directories %s" % dirname)
+                        os.makedirs(dirname)
+
+                    if os.path.exists(linkpath):
+                        logger.warn("Device link already exists: %s" % linkpath)
+
+                    else:
+                        logger.debug("Created device symlink to %s at %s" % (path, linkpath))
+                        os.symlink(path, linkpath)
+
+            elif context.action == "remove":
+                # Deal with device links
+                for devlink in device.get_devlinks():
+                    linkpath = os.path.join(cdev.device.DEV_PATH, devlink)
+                    dirname = os.path.dirname(linkpath)
+
+                    try:
+                        target = os.readlink(linkpath)
+                    except OSError as e:
+                        if e.errno == 22:
+                            logger.warn("Could not remove device link %s: not a symbolic link!" % linkpath)
+                        elif e.errno == 2:
+                            logger.warn("Could not remove device link %s: no such file!" % linkpath)
+                        else:
+                            raise
+                    else:
+                        if os.path.normpath(target) != os.path.normpath(path):
+                            logger.warn("Symbolic link at %s doesn't point to device %s, not removing" % (linkpath, path))
+                        else:
+                            os.unlink(linkpath)
+                            logger.debug("Removed device link to %s at %s" % (path, linkpath))
+
+                        while dirname.startswith(cdev.device.DEV_PATH + "/"):
+                            if not os.listdir(dirname):
+                                logger.info("Removing empty subdir: %s" % dirname)
+                                os.rmdir(dirname)
+                            else:
+                                break
+                            dirname = os.path.dirname(dirname)
+
+                # Deal with the device node
+                logger.debug("Removing device node for %s from %s" % (format_device_node(devnum, is_block), path))
+
+                # Check if the device is what we expect
+                try:
+                    st = os.stat(path)
+                except OSError as e:
+                    if e.errno == 2:
+                        logger.warn("Could not remove device node %s: no such file!" % path)
+                    else:
+                        raise
+                else:
+                    if st.st_rdev != devnum:
+                        logger.error("Device node at %s doesn't point to our device %s, but at %s; not removing" % (path, format_device_node(devnum, is_block), format_device_node(st.st_rdev, stat.S_ISBLK(st.st_mode))))
+                    else:
+                        os.unlink(path)
+
+                        # clean up empty parent dirs
+                        dirname = os.path.dirname(path)
+                        while dirname.startswith(cdev.device.DEV_PATH + "/"):
+                            if not os.listdir(dirname):
+                                logger.info("Removing empty subdir: %s" % dirname)
+                                os.rmdir(dirname)
+                            else:
+                                break
+                            dirname = os.path.dirname(dirname)
+
+
+def format_device_node(devnum, is_block=False):
+    return "%s%i:%i" % ('b' if is_block else 'c', os.major(devnum), os.minor(devnum))
+
+
+def load_rules(rules_dir):
+    rulesets = []
+    for fn in sorted(os.listdir(rules_dir)):
+        try:
+            ruleset = cdev.client_rules.RulesPreset.parse(os.path.join(rules_dir, fn))
+        except:
+            logger.exception("Exception parsing rules from %s" % fn)
+        else:
+            rulesets.append(ruleset)
+    return rulesets
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog=argv[0])
+    parser.add_argument("-n", "--name", required=True, help="The name of this container")
+    parser.add_argument("-b", "--boot", action="store_true", help="Request initial device set")
+    parser.add_argument("-B", "--boot-only", action="store_true", help="ONLY request existing devices, quit afterwards.")
+    parser.add_argument("--shutdown", action="store_true", help="Request removal of all existing devices, quit afterwards.")
+    parser.add_argument("-s", "--socket-path", help="Path to the cdev control socket [%(default)s]", default="cdev.control")
+    parser.add_argument("-r", "--rules-dir", help="Path to the cdev client rules [%(default)s]", default="rules.d")
+    parser.add_argument("--systemd", action="store_true", help="Enable the systemd notify interface and socket activation")
+    parser.add_argument("--dry", action="store_true", help="Run dry. Don't modify any files. Breaks rule processing.")
+    return parser.parse_args(argv[1:])
+
+
+def main(argv):
+    args = parse_args(argv)
+
+    if args.systemd and (args.shutdown or args.boot_only):
+        logger.error("--systemd is not compatible with --boot-only and --shutdown")
+        return -errno.EINVAL
+
+    if os.getuid() != 0:
+        logger.error("Requires root privileges.")
+        return -errno.EPERM
+
+    logger.info("Starting cdev-udevd for container %s" % args.name)
+
+    # Get control socket from systemd
+    if args.systemd and os.getenv("LISTEN_PID", None) == str(os.getpid()):
+        logger.info("Using systemd socket activation!")
+        control_fd = 3
+    else:
+        control_fd = -1
+
+    if not os.path.exists(cdev.device.RUNTIME_DATA_PATH) and not args.dry:
+        os.makedirs(cdev.device.RUNTIME_DATA_PATH)
+
+    # IMPORTANT: Set the UMASK to make device node creation work.
+    # revised: Should check our options, for now just add a os.chmod() call for each device node.
+    #os.umask(0o000)
+
+    loop = asyncio.get_event_loop()
+
+    udevd = CdevUdevd(args)
+    control = CdevControl.new(udevd, control_fd)
+
+    def handle_sigint():
+        udevd.future.set_result("Caught SIGINT")
+    loop.add_signal_handler(signal.SIGINT, handle_sigint)
+
+    try:
+        control.start()
+        t = udevd.start()
+        loop.run_until_complete(t)
+    except OSError as e:
+        logger.exception("Killed by Exception")
+        return -e.errno
+    except Exception:
+        logger.exception("Killed by Exception")
+        return -1
+
+    logger.info("Done")
+    return 0
+
+
+if __name__ == "__main__":
+    import cdev.logging
+    cdev.logging.basicConfig()
+    import sys
+    sys.exit(main(sys.argv))

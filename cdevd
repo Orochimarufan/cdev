@@ -1,0 +1,439 @@
+#!/usr/bin/python
+# cdevd -- A device management/hotplug daemon for container environments. [Host Component]
+#
+# Copyright (c) 2014 Taeyeon Mori
+# All rights reserved.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+import os
+import asyncio
+import logging
+import signal
+import argparse
+import socket
+
+logger = logging.getLogger("cdev.cdevd")
+
+import cdev.protocol
+import cdev.device
+import cdev.netlink
+import cdev.async
+import cdev.filter_rules
+import cdev.cgroups
+
+clients = [] # all active clients
+program = asyncio.Future() # program shuts down when future is done
+
+
+def tuple_from_exception(exc):
+    return type(exc), exc, exc.__traceback__
+
+
+class Client:
+    last_id = -1
+
+    crules_dir = None
+
+    @classmethod
+    def get_new_id(cls):
+        cls.last_id += 1
+        return cls.last_id
+
+    def __init__(self, stream_reader, stream_writer):
+        """
+        Create a new client
+        """
+        self.id = self.get_new_id()
+
+        self.logger = logger.getChild("client%i" % self.id)
+
+        self.ruleset = None
+
+        self.queue = asyncio.Queue()
+        self.name = None
+        self.ready = False
+        self.dry = False
+
+        self.reader = stream_reader
+        self.writer = stream_writer
+
+        self.task = asyncio.Task(self.run())
+        self.task.add_done_callback(self.done)
+
+        clients.append(self)
+
+        self.logger.info("Opened connection.")
+
+    def done(self, task):
+        clients.remove(self)
+
+        self.writer.close()
+
+        self.logger.info("Closed connection.")
+
+        if task.exception():
+            self.logger.error("Client terminated from exception.", exc_info=tuple_from_exception(task.exception()))
+
+    def send(self, command, data=b'', type=cdev.protocol.D_DATA, fmt=None):
+        cdev.protocol.Message(command, type, data, fmt).write_to(self.writer)
+
+    def recv(self, timeout=None):
+        if timeout is not None:
+            return cdev.async.recv_message_timeout(self.reader, timeout)
+        else:
+            return cdev.async.recv_message(self.reader)
+
+    def initialize_client(self, name):
+        """
+        Initialize after handshake
+        """
+        self.name = name
+
+        self.logger.info("Connected to container '%s'" % self.name)
+
+        self.load_ruleset()
+
+        self.ready = True
+
+    def load_ruleset(self):
+        self.logger.info("Loading rules for %s" % self.name)
+
+        fn = self.name + ".rules"
+        if not os.path.exists(os.path.join(self.crules_dir, fn)):
+            fn = self.name.lower() + ".rules"
+            if not os.path.exists(os.path.join(self.crules_dir, fn)):
+                self.logger.warn("No rules file found for %s" % self.name)
+                return
+
+        try:
+            self.ruleset = cdev.filter_rules.RulesPreset.parse(os.path.join(self.crules_dir, fn))
+        except Exception:
+            self.logger.exception("Couldn't parse rules!")
+
+        #print(repr(self.ruleset))
+
+    @asyncio.coroutine
+    def run(self):
+        self.logger.debug("Greeting Client")
+        self.send(b"HELLO")
+
+        # wait for response
+        msg = yield from self.recv(10.0)
+
+        if msg is None:
+            self.logger.warn("Didn't get response from client - closing connection")
+            self.send(b"BYE")
+            return
+
+        self.initialize_client(msg.data.decode())
+
+        socket_listener = asyncio.Task(self.recv())
+        queue_listener = asyncio.Task(self.queue.get())
+
+        while True:
+            done, pending = yield from asyncio.wait([socket_listener, queue_listener, program], return_when=asyncio.FIRST_COMPLETED)
+
+            # Check if we should quit
+            if program in done:
+                self.send(b"BYE", str(program.result()).encode())
+
+                for task in pending:
+                    task.cancel()
+
+                return
+
+            # Serve the socket
+            if socket_listener in done:
+                msg = socket_listener.result()
+                self.logger.debug("Got message %s" % msg.command)
+
+                if msg.command == b"bye":
+                    self.logger.info("Closing connection: %s" % msg.data.decode())
+                    for task in pending:
+                        if task is not program: # we don't want to shut down the whole program!
+                            task.cancel()
+                    self.send(b"BYE", b"ACK")
+                    return
+
+                elif msg.command in (b"boot", b"shutdown"):
+                    # Apply rules to all existing devices.
+                    what = "booting" if msg.command == b"boot" else "shutting down"
+                    action = "add" if msg.command == b"boot" else "remove"
+
+                    self.logger.info("Begin %s %s" % (what, self.name))
+                    self.send(b"BEGINCMD", msg.command)
+
+                    # Walk the device tree
+                    for dev in walk_device_tree():
+                        self.handle_uevent(dev, action, source="sys")
+
+                    # Done
+                    self.send(b"ENDCMD", msg.command)
+                    self.logger.info("Done %s %s" % (what, self.name))
+
+                elif msg.command == b"dry_run":
+                    self.logger.info("Client is running dry. (No persistent changes are done.)")
+                    self.dry = True
+
+                elif msg.command == b"echo":
+                    msg.command = b"ECHO"
+                    msg.write_to(self.writer)
+                    self.logger.info("Replied to echo: %s" % msg.data)
+
+                else:
+                    self.logger.warn("Unknown Command %s" % msg.command)
+
+                socket_listener = asyncio.Task(self.recv())
+
+            # Send off queued events
+            if queue_listener in done:
+                op = queue_listener.result()
+
+                if op[0] == "HANDLE_UEVENT":
+                    self.handle_uevent(device=op[1], action=op[2], event=op[3], source=op[4])
+
+                elif op[0] == "SEND_UEVENT_RAW":
+                    self.logger.debug("Sending queued UEVENT")
+
+                    # Send the event
+                    self.send(b"UEVENT", op[1])
+
+                queue_listener = asyncio.Task(self.queue.get())
+
+    def filter(self, device, action="add", source="sys"):
+        """
+        Creates a context and applies the rules
+        """
+        context = cdev.filter_rules.Context(device, action, source)
+
+        if self.ruleset:
+            signal.alarm(2)
+            try:
+                self.ruleset(context)
+            except ExecutionTimeout:
+                self.logger.error("Rule execution timed out!")
+            finally:
+                signal.alarm(0)
+
+        return context
+
+    def handle_uevent(self, device, action, *, event=None, source="sys"):
+        """
+        Handle an event.
+        """
+        if not self.ready:
+            return
+
+        context = self.filter(device, action, source)
+
+        if context.result:
+            self.logger.debug("UEVENT: %s@%s" % (action, device.devpath))
+
+            # Manage CGroups
+            if context.cgroups and action in ("add", "remove") and not self.dry:
+                cgm = cdev.cgroups.ControlGroupManager.get(context.cgroups)
+                if cgm:
+                    if action == "add":
+                        cgm.allow(self.name, device)
+                    else:
+                        cgm.deny(self.name, device)
+
+            # Forward stuff
+            if "ENV" in context.forward and device.get_id_filename() is not None and action != "remove": # Remove events don't need new environment.
+                self.send(b"FWD_ENV", b'\0'.join((device.devpath.encode(), device.make_db_env_buffer())))
+
+            # send event
+            if event is None:
+                event = cdev.netlink.UdevNetlinkMessage.from_device_and_action(device, action, include_env="ENV" in context.forward)
+            elif "ENV" not in context.forward:
+                # we need to remove the environment info
+                event = event.clone(props=device.get_properties())
+            if event.original_buffer is not None:
+                event_buffer = event.original_buffer
+            else:
+                event_buffer = event.pack()
+            self.send(b"UEVENT", event_buffer)
+
+            # send possible second event
+            if context.emit:
+                what, action, options = context.emit
+
+                if not what or what == ".": # just send another event for the same device
+                    self.logger.debug("Emitting additional %s event." % action)
+                    event = event.clone(action=action)
+                else:
+                    path = os.path.join(context.device.syspath, what)
+                    device = cdev.device.Device.from_syspath_or_registry(path)
+                    if not device:
+                        self.logger.error("Could not create device at %s, not emitting additional event." % path)
+                        return
+                    self.logger.debug("Emitting additional %s event on %s" % (action, device.devpath))
+                    event = cdev.netlink.UdevNetlinkMessage.from_device_and_action(device, action, include_env="ENV" in context.forward and "noenv" not in options)
+
+                if "queue" not in options:
+                    self.send(b"UEVENT", event.pack())
+                else:
+                    self.queue.put_nowait(("SEND_UEVENT_RAW", event.pack()))
+
+
+def walk_device_tree(topdown=True):
+    for (path, dirs, files) in os.walk(cdev.device.SYS_PATH + "/devices", topdown):
+        # devices need a uevent file
+        if "uevent" in files:
+            device = cdev.device.Device.from_syspath_or_registry(path)
+            if device:
+                yield device
+
+
+@asyncio.coroutine
+def handle_uevents(uevent_channel=cdev.netlink.UDEV_NETLINK_UDEV):
+    """
+    Handle netlink uevent messages
+    """
+    sock = cdev.netlink.open_netlink(cdev.socket.NETLINK_KOBJECT_UEVENT, uevent_channel)
+
+    source = "udev" if uevent_channel == cdev.netlink.UDEV_NETLINK_UDEV else "kernel"
+
+    while True:
+        # listen for new event
+        data, ancdata, flags, addr = yield from cdev.async.sock_recvmsg(sock, 2048, 512)
+
+        # Parse event and create device object
+        is_libudev_message = data[:8] == cdev.netlink.udev_netlink_header_prefix
+        if is_libudev_message:
+            event = cdev.netlink.UdevNetlinkMessage.parse(data)
+        else:
+            event = cdev.netlink.UdevNetlinkMessage.from_kernel_message(data)
+
+        device = event.make_device()
+
+        if not is_libudev_message:
+            event.fill_bloom_from_device(device)
+
+        #logger.debug("UEVENT: %s" % ",".join("%s=%s" % prop for prop in props.items()))
+        #logger.debug("UEVENT: %s" % ",".join(props.keys()))
+        logger.debug("UEVENT: %s@%s" % (event.get_action(), device.devpath))
+
+        # check if any client should get this event
+        for client in clients:
+            # proper way would obviously be through the queue, but whatever...
+            client.handle_uevent(device, event.get_action(), event=event, source=source)
+            #client.queue.put_nowait(("HANDLE_UEVENT", device, event.get_action(), event, source))
+
+        # If the device was removed, purge it from the device registry, the queue will keep it alive until all clients are done processing.
+        if event.get_action() == "remove":
+            device.invalidate()
+            cdev.filter_rules.cenv_remove(device)
+
+
+class ExecutionTimeout(Exception):
+    pass
+
+
+def sigalrm_handler():
+    raise ExecutionTimeout()
+
+
+def parse_args(argv):
+    # Parse commandline arguments
+    parser = argparse.ArgumentParser(argv[0])
+    parser.add_argument("-s", "--socket-path", help="Path to the cdev control socket [%(default)s]", default="cdev.control")
+    parser.add_argument("-c", "--container-rules-dir", help="Path to the per-container rules [%(default)s]", default="containers.d")
+    parser.add_argument("-k", "--kernel-events", action="store_true", help="Listen to Kernel events instead of udevd events.")
+    parser.add_argument("--systemd", action="store_true", help="Try to use systemd socket activation")
+    return parser.parse_args(argv[1:])
+
+
+def main(argv):
+    args = parse_args(argv)
+
+    # UGLY
+    Client.crules_dir = args.container_rules_dir
+
+    logger.info("Starting cdevd v0.1 - (c) 2014 Taeyeon Mori")
+    loop = asyncio.get_event_loop()
+
+    # Handle systemd socket passing
+    if args.systemd and os.getenv("LISTEN_PID", None) == str(os.getpid()):
+        logger.info("Using systemd socket activation!")
+        sock = socket.fromfd(3, socket.AF_UNIX, socket.SOCK_STREAM)
+
+    # Otherwise, we need to check if the socket is available
+    elif os.path.exists(args.socket_path):
+        logger.error("Socket already in use: %s" % args.socket_path)
+        return -1
+
+    else:
+        sock = None
+
+    # Gracefully shutdown on SIGINT and SIGTERM
+    loop.add_signal_handler(signal.SIGINT, program.set_result, "Received SIGINT")
+    loop.add_signal_handler(signal.SIGTERM, program.set_result, "Received SIGTERM")
+
+    # Use signal.alarm() to kill misbehaving rules.
+    loop.add_signal_handler(signal.SIGALRM, sigalrm_handler)
+
+    # Take over responsibility for the device registry
+    cdev.device.Device.enable_persistent_registry()
+
+    # Listen for uevents on NETLINK
+    logger.info("Listening to events on NETLINK_KOBJECT_UEVENT/UDEV_NETLINK_" + ("KERNEL" if args.kernel_events else "UDEV"))
+    asyncio.async(handle_uevents(cdev.netlink.UDEV_NETLINK_KERNEL if args.kernel_events else cdev.netlink.UDEV_NETLINK_UDEV))
+
+    # make sure to clean up the socket!
+    try:
+        # Listen for connections on the control socket
+        # pick up our previous work on socket activation
+        if sock is not None:
+            logger.info("Listening for connections on unix+fd://3 (probably at %s)" % args.socket_path)
+            serv_t = asyncio.async(asyncio.start_unix_server(Client, sock=sock))
+        else:
+            logger.info("Listening to connections on unix://%s" % args.socket_path)
+            serv_t = asyncio.async(asyncio.start_unix_server(Client, args.socket_path))
+        loop.run_until_complete(serv_t)
+
+        # Run until something breaks :)
+        logger.debug("Entering mainloop.")
+        loop.run_until_complete(program)
+
+        # Shut down
+        logger.info("Shutting down. (%s)" % program.result())
+
+        # Close the listening socket
+        serv_t.result().close()
+
+        # Wait for all clients to finish
+        while clients:
+            task = clients[0].task
+            try:
+                loop.run_until_complete(task)
+            except:
+                logger.exception("Exception while shutting down connection")
+
+    finally:
+        # clean up the socket file
+        if os.path.exists(args.socket_path):
+            os.unlink(args.socket_path)
+
+    logger.info("cdevd cleanly shut down.")
+    return 0
+
+
+if __name__ == "__main__":
+    import cdev.logging
+    import sys
+    cdev.logging.basicConfig()
+    sys.exit(main(sys.argv))
