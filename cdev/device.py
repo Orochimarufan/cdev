@@ -218,14 +218,22 @@ class Device:
             return
 
         path = os.path.join(self.syspath, "uevent")
-        if not os.path.exists(path):
+        if not os.path.exists(path) or not os.access(path, os.R_OK, effective_ids=True):
             #logger.warn("Couldn't open device uevent file: No such file or directory (%s)" % path)
+            return
+            
+        # Apparently, open() can still fail even after the above checks (Permission Denied, seems to happen on /sys/bus/usb/uevent a lot)
+        # So we make sure not to break the system if it does.
+        try:
+            f = open(path, "r")
+        except:
+            logger.exception("Failed to open device uevent file for reading: %s" % path)
             return
 
         self.is_uevent_loaded = True
 
         maj = min = 0
-        with open(path, "r") as f:
+        with f:
             for line in f:
                 if not line.strip():
                     continue
@@ -458,7 +466,7 @@ class Device:
 
     # Flush the current db state to disk
     # USE WITH CARE!
-    def flush_db(self, *, db_file):
+    def flush_db(self, *, db_file=None):
         """
         Stores all environment entries, devlinks and tags in the udev database
         """
@@ -479,7 +487,7 @@ class Device:
                 fp.write(line)
             for devlink in self.devlinks:
                 fp.write("S:%s\n" % devlink)
-            for env_entry in self.environment:
+            for env_entry in self.environment.items():
                 fp.write("E:%s=%s\n" % env_entry)
             for tag in self.tags:
                 fp.write("G:%s\n" % tag)

@@ -80,14 +80,14 @@ class UdevControlMessage:
     def __getattr__(self, name):
         if name in self.header.names:
             return getattr(self.header, name)
-        raise AttributeError("UdevNetlinkMessage doesn't have an attribute called %s" % name)
+        raise AttributeError("UdevControlMessage doesn't have an attribute called %s" % name)
 
     def __setattr__(self, name, value):
         if name in self.__slots__:
             return super().__setattr__(name, value)
         elif name in self.header.names:
             return setattr(self.header, name, value)
-        raise AttributeError("UdevNetlinkMessage doesn't have an attribute called %s" % name)
+        raise AttributeError("UdevControlMessage doesn't have an attribute called %s" % name)
 
     # Emulate the union
     @property
@@ -140,14 +140,14 @@ class UdevControlConnection:
     def recv(self):
         data, ancdata, flags, addr = (yield from async.sock_recvmsg(self.sock, UdevControlMessage.size, socket.CMSG_SPACE(socket.ucred.size)))
 
-        if not ancdata or ancdata[0][1] != socket.SCM_CREDENTIALS:
-            logger.error("no sender credentials received, message ignored")
-            return None
+        #if not ancdata or ancdata[0][1] != socket.SCM_CREDENTIALS:
+        #    logger.error("no sender credentials received, message ignored")
+        #    return None
 
-        cred = socket.ucred.unpack(ancdata[0][2])
-        if cred.uid > 0:
-            logger.error("sender uid=%i, message ignored" % cred.uid)
-            return None
+        #cred = socket.ucred.unpack(ancdata[0][2])
+        #if cred.uid > 0:
+        #    logger.error("sender uid=%i, message ignored" % cred.uid)
+        #    return None
 
         return UdevControlMessage.parse(data, conn=self)
 

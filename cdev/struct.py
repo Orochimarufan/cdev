@@ -180,7 +180,7 @@ class MixStructType(StructType):
         #print(formats, cls._itemcnt, cls._itemoff, len(names))
 
         if len(cls.names) != cls._totalct:
-            raise TypeError("Struct holds %i items, but %i names were specified!" % (cls._itemcnt, len(names)))
+            raise TypeError("Struct holds %i items, but %i names were specified!" % (cls._totalct, len(names)))
 
 
 class _MixStructBase:

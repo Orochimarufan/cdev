@@ -240,7 +240,7 @@ class CdevUdevd:
         device = context.device
         node = device.devnode
         devnum = device.get_devnum()
-        is_block = device.subsystem == "block"
+        is_block = device.get_subsystem() == "block"
 
         if node and os.major(devnum) != 0 and not self.options.dry:
             path = os.path.join(cdev.device.DEV_PATH, node)
@@ -275,7 +275,7 @@ class CdevUdevd:
                     logger.error("Device node already exists: %s" % path)
 
                 else:
-                    os.mknod(path, mode | (stat.S_IFBLK if type == 'b' else stat.S_IFCHR), devnum)
+                    os.mknod(path, mode | (stat.S_IFBLK if is_block else stat.S_IFCHR), devnum)
                     os.chown(path, uid, gid)
                     os.chmod(path, mode)
 

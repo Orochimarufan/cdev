@@ -24,9 +24,10 @@ Base implementation for udev-like rules
 
 import re
 import operator
-import fnmatch
 import os
 import logging
+
+from . import fnmatch
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,9 @@ class _Condition:
     __slots__ = ("operation", "rvalue")
 
     def __init__(self, operation, rvalue):
+        if hasattr(operation, "compile"):
+            rvalue = operation.compile(rvalue)
+
         self.operation = operation
         self.rvalue = rvalue
 
@@ -343,34 +347,38 @@ class DebugAssignment(_SimpleAssignment):
 
 # -----------------------------------------------------------------------------
 # Operators
-def op_assign(assignment, context): # =
+def op_assign(assignment, context):     # =
     assignment.assign(context)
 
-def op_extend(assignment, context): # +=
+def op_extend(assignment, context):     # +=
     assignment.extend(context)
 
-def op_subtract(assignment, context): # -=
+def op_subtract(assignment, context):   # -=
     assignment.subtract(context)
 
-op_equals = operator.eq             # ===
-op_doesntequal = operator.ne        # !==
+op_equals = operator.eq                 # ===
+op_doesntequal = operator.ne            # !==
 
-def op_fnmatches(lvalue, rvalue):   # ==
-    return lvalue is not None and fnmatch.fnmatchcase(lvalue, rvalue)
+def op_fnmatches(lvalue: str, rvalue: re._pattern_type) -> bool:        # ==
+    return lvalue is not None and rvalue.match(lvalue) is not None
+op_fnmatches.compile = fnmatch.compile
 
-def op_doesntfnmatch(lvalue, rvalue):# !=
-    return lvalue is None or not fnmatch.fnmatchcase(lvalue, rvalue)
+def op_doesntfnmatch(lvalue: str, rvalue: re._pattern_type) -> bool:    # !=
+    return lvalue is None or rvalue.match(lvalue) is None
+op_doesntfnmatch.compile = fnmatch.compile
 
-def op_rematches(lvalue, rvalue):   # ~=
-    return lvalue is not None and re.search(rvalue, lvalue)
+def op_rematches(lvalue: str, rvalue: re._pattern_type) -> bool:        # ~=
+    return lvalue is not None and rvalue.search(lvalue) is not None
+op_rematches.compile = re.compile
 
-def op_doesntrematch(lvalue, rvalue):# ~=
-    return lvalue is None or not re.search(rvalue, lvalue)
+def op_doesntrematch(lvalue: str, rvalue: re._pattern_type) -> bool:    # ~=
+    return lvalue is None or rvalue.search(lvalue) is None
+op_doesntrematch.compile = re.compile
 
 def match_log(lvalue, rvalue):      # ?=
     res = lvalue == rvalue
     if lvalue is not None:
-        print(lvalue, "==" if res else "!=", rvalue)
+        logger.info("Rule Debug: %r %s %r" % (lvalue, "==" if res else "!=", rvalue))
     return res
 
 
@@ -544,11 +552,12 @@ class RulesPreset:
                             # Assignment
                             # We need to special-case LABEL=
                             if name == "LABEL":
-                                if op == op_assign:
-                                    ruleset.add_label_here(value)
-                                    cond = False
-                                else:
-                                    raise SyntaxError("LABEL can only be assigned (=) to.")
+                                raise SyntaxError("LABEL isn't working in this version.")
+                                #if op == op_assign:
+                                #    ruleset.add_label_here(value)
+                                #    cond = False
+                                #else:
+                                #    raise SyntaxError("LABEL can only be assigned (=) to.")
                             else:
                                 # "Normal" assignment
                                 try:

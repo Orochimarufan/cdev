@@ -25,4 +25,5 @@
 SUBSYSTEM==="sound",GROUP="audio",MODE="660"
 SUBSYSTEM==="graphics",GROUP="video",MODE="660"
 SUBSYSTEM==="drm",GROUP="video",MODE="660"
-SUBSYSTEM==="input",MODE="600"
+SUBSYSTEM==="input",GROUP="input",MODE="660",KERNEL=="js*",MODE="664"
+SUBSYSTEM==="block",GROUP="disk",MODE="660",KERNEL=="sr*",GROUP="optical"
