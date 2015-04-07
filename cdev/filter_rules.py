@@ -102,6 +102,7 @@ class ForwardAssignment(rules._SetAssignment):
     """
     Forward certain things:
         - ENV: the udev environment
+        - TAGS: the udev tags
     """
 
     __slots__ = ()
@@ -111,7 +112,7 @@ class ForwardAssignment(rules._SetAssignment):
 
     @classmethod
     def create_value(cls, value):
-        if value.lower() not in ("env",):
+        if value.lower() not in ("env","tags"):
             raise SyntaxError("Unknown value for FORWARD: %s" % value)
         return value.upper()
 

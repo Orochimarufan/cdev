@@ -315,6 +315,8 @@ class Device:
 
             for line in f:
                 line = line.rstrip("\n")
+                if not line:
+                    continue
 
                 if line[0] == 'S':
                     # devlink
@@ -414,6 +416,79 @@ class Device:
 
         self.environment = dict
 
+    @property
+    def db_path(self):
+        """
+        Generate a udev data path for a device
+        raises TypeError if the device ID can't be determined
+        """
+        id = self.get_id_filename()
+        if not id:
+            raise TypeError("Could not determine device identifier, maybe you need to pass db_file to the calling function?")
+        return os.path.join(RUNTIME_DATA_PATH, id)
+    
+    def make_sync_buffer(self, properties="EG", *, db_file=None):
+        """
+        Generate a buffer with all udev db lines of types in properties
+        Known properties:
+            E: environment
+            G: tags
+        """
+        self.read_db(db_file=db_file)
+        props = properties.upper()
+
+        sync = []
+        if "E" in props:
+            for item in self.environment.items():
+                sync.append("E:{}={}".format(*item).encode())
+        if "G" in props:
+            for tag in self.tags:
+                sync.append("G:{}".format(tag).encode())
+        return b'\n'.join(sync)
+
+
+    def store_sync_buffer(self, buffer, properties="EG", *, db_file=None):
+        """
+        Replace specified properties with those from the sync buffer
+        """
+        self.read_db(db_file=db_file)
+
+        if db_file is None:
+            db_file = self.db_path
+
+        props = properties.upper()
+        bprops = props.encode()
+
+        if "E" in props:
+            self.environment.clear()
+        if "G" in props:
+            self.tags.clear()
+
+        lines = []
+        if os.path.exists(db_file):
+            with open(db_file, "rb") as f:
+                for line in f:
+                    if line[0] not in bprops:
+                        lines.append(line)
+
+        for line in buffer.splitlines(True):
+            if not line or line[0] not in bprops:
+                continue
+            elif line[0] in b'E' and b'=' in line:
+                k, v = line[2:-1].decode().split('=')
+                self.environment[k] = v
+                lines.append(line)
+            elif line[0] in b'G':
+                self.tags.add(line[2:-1].decode())
+                lines.append(line)
+            else:
+                logger.warn("Unknown sync type: %s" % chr(line[0]))
+        
+        with open(db_file, "wb") as f:
+            for line in lines:
+                f.write(line)
+            f.write(b'\n') # The sync buffer doesn't have the trailing \n
+
     # The *_env_buffer methods operate directly on the udev database file.
     # store_new_env_from_buffer therefore BREAKS ENVIROMENT SYNC!
     def make_db_env_buffer(self, *, db_file=None, error_if_nonexistent=False):
@@ -421,10 +496,7 @@ class Device:
         Like read_db_env, but makes a bytestring with \0-separated KEY=VALUE pairs
         """
         if db_file is None:
-            id = self.get_id_filename()
-            if not id:
-                raise TypeError("get_id_filename() returned None and db_file wasn't given.")
-            db_file = os.path.join(RUNTIME_DATA_PATH, id)
+            db_file = self.db_path
 
         kvp = []
         if os.path.exists(db_file):

@@ -92,7 +92,8 @@ class CdevUdevd:
         return self.task
 
     def done(self, task):
-        self.writer.close()
+        if self.writer:
+            self.writer.close()
 
     def send(self, command, data=b'', type=cdev.protocol.D_DATA, fmt=None):
         cdev.protocol.Message(command, type, data, fmt).write_to(self.writer)
@@ -205,6 +206,18 @@ class CdevUdevd:
                     device.store_new_env_buffer(env_buffer)
 
                 # device will be gc'd :P
+
+            elif msg.command == b"SYNC":
+                devpath, props, sync_buffer = msg.data.split(b'\0', 2)
+
+                devpath = devpath.decode()
+                props = props.decode()
+
+                logger.info("Synching device %s (%s)" % (devpath, props))
+
+                device = cdev.device.Device.from_devpath_or_registry(devpath)
+                if not self.options.dry:
+                    device.store_sync_buffer(sync_buffer, props)
 
             elif msg.command == b"BYE":
                 logger.warn("Host daemon closed the connection: %s" % msg.data.decode())
