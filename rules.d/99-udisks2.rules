@@ -1,0 +1,7 @@
+# Udisks2: disable stupid /media/$USER/ mountpoints...
+# See https://wiki.archlinux.org/index.php/Udisks#udisks2:_mount_to_.2Fmedia
+# The cdev globbing algorithm is very limited as per python:fnmatch
+# It needs to be replaced at some point (TODO)
+ENV{ID_FS_USAGE}==="filesystem",ENV{UDISKS_FILESYSTEM_SHARED}="1"
+ENV{ID_FS_USAGE}==="other",ENV{UDISKS_FILESYSTEM_SHARED}="1"
+ENV{ID_FS_USAGE}==="crypto",ENV{UDISKS_FILESYSTEM_SHARED}="1"
