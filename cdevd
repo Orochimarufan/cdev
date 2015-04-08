@@ -262,9 +262,6 @@ class Client:
                     props = "".join(forward)
                     self.send(b"SYNC", b'\0'.join((device.devpath.encode(), props.encode(), device.make_sync_buffer(props))))
 
-#            if "ENV" in context.forward and device.get_id_filename() is not None and action != "remove": # Remove events don't need new environment.
-#                self.send(b"FWD_ENV", b'\0'.join((device.devpath.encode(), device.make_db_env_buffer())))
-
             # send event
             if event is None:
                 event = cdev.netlink.UdevNetlinkMessage.from_device_and_action(device, action, include_env="ENV" in context.forward)

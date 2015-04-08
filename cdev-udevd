@@ -196,17 +196,6 @@ class CdevUdevd:
                     if e.errno != errno.ECONNREFUSED: # ECONNREFUSED is expected, because we don't want to send a unicast message.
                         raise
 
-            elif msg.command == b"FWD_ENV":
-                devpath, env_buffer = msg.data.split(b'\0', 1)
-                devpath = devpath.decode()
-                logger.info("Receiving environment for %s" % devpath)
-
-                device = cdev.device.Device.from_devpath_or_registry(devpath)
-                if not self.options.dry:
-                    device.store_new_env_buffer(env_buffer)
-
-                # device will be gc'd :P
-
             elif msg.command == b"SYNC":
                 devpath, props, sync_buffer = msg.data.split(b'\0', 2)
 

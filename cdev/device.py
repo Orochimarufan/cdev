@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # udev runtime dir
 RUNTIME_PATH = "/run/udev"
 RUNTIME_DATA_PATH = RUNTIME_PATH + "/data"
+RUNTIME_TAGS_PATH = RUNTIME_PATH + "/tags"
 SYS_PATH = "/sys"
 DEV_PATH = "/dev"
 
@@ -45,7 +46,7 @@ class Device:
     __slots__ = ("syspath", "devpath", "sysname", "sysnum",
                  "devnum", "devnode", "devnode_mode", "devtype", "ifindex",
                  "id_filename", "subsystem", "environment",
-                 "properties", "sysattrs", "devlinks", "tags",
+                 "properties", "sysattrs", "devlinks", "tags", "_db_unknown",
                  "is_uevent_loaded", "is_db_loaded", "is_initialized",
                  "__weakref__")
 
@@ -71,6 +72,7 @@ class Device:
         self.sysattrs = {}
         self.devlinks = set()
         self.tags = set()
+        self._db_unknown = []
 
         self.is_uevent_loaded = False
         self.is_db_loaded = False
@@ -312,6 +314,7 @@ class Device:
                 self.devlinks = set()
                 self.environment = {}
                 self.tags = set()
+                self._db_unknown = []
 
             for line in f:
                 line = line.rstrip("\n")
@@ -321,9 +324,9 @@ class Device:
                 if line[0] == 'S':
                     # devlink
                     self.devlinks.add(line[2:])
-                elif line[0] == 'L':
+                #elif line[0] == 'L':
                     # devlink priority
-                    pass#self.set_devlink_priority(int(line[2:]))
+                #    self.set_devlink_priority(int(line[2:]))
                 elif line[0] == 'E':
                     # property
                     prop, value = line[2:].split("=", 1)
@@ -331,12 +334,14 @@ class Device:
                 elif line[0] == 'G':
                     # tag
                     self.tags.add(line[2:])
-                elif line[0] == 'W':
+                #elif line[0] == 'W':
                     # watch handle
-                    pass#self.set_watch_handle(int(line[2:]))
-                elif line[0] == 'I':
+                #    pass#self.set_watch_handle(int(line[2:]))
+                #elif line[0] == 'I':
                     # initialization time
-                    pass#self.set_usec_initialized(int(line[2:]))
+                #    pass#self.set_usec_initialized(int(line[2:]))
+                else:
+                    self._db_unknown.append(line)
 
         #logger.info("Read udev db file for %s" % self.devpath)
 
@@ -344,77 +349,28 @@ class Device:
     def store_one_env(self, key, value, *, db_file=None):
         """
         Write a value to the environment file
+        DEPRECATED
         """
-        if db_file is None:
-            id = self.get_id_filename()
-            if not id:
-                raise TypeError("get_id_filename() returned None and db_file wasn't given.")
-            db_file = os.path.join(RUNTIME_DATA_PATH, id)
-
-        lines = []
-        if os.path.exists(db_file):
-            with open(db_file, "r") as f:
-                for line in f:
-                    if not line.startswith("E:%s=" % key):
-                        lines.append(line)
-
-        lines.append("E:%s=%s\n" % (key, value))
-
-        with open(db_file, "w") as f:
-            for line in lines:
-                f.write(line)
-
-        # update
         self.environment[key] = value
 
+        self.flush_db(db_file=db_file)
+
     def store_many_env(self, dict, *, db_file=None):
-        if db_file is None:
-            id = self.get_id_filename()
-            if not id:
-                raise TypeError("get_id_filename() returned None and db_file wasn't given.")
-            db_file = os.path.join(RUNTIME_DATA_PATH, id)
-
-        lines = []
-        if os.path.exists(db_file):
-            with open(db_file, "r") as f:
-                for line in f:
-                    if not (line.startswith("E:") and line[2:].split("=", 1)[0] in dict):
-                        lines.append(line)
-
-        for i in dict.items():
-            lines.append("E:%s=%s\n" % i)
-
-        with open(db_file, "w") as f:
-            for line in lines:
-                f.write(line)
-
+        """
+        DEPRECATED
+        """
         self.environment.update(dict)
+
+        self.flush_db(db_file=db_file)
 
     def store_new_env(self, dict, *, db_file=None):
         """
         Like store_many_env, but replaces all evnironment entries.
+        DEPRECATED
         """
-        if db_file is None:
-            id = self.get_id_filename()
-            if not id:
-                raise TypeError("get_id_filename() returned None and db_file wasn't given.")
-            db_file = os.path.join(RUNTIME_DATA_PATH, id)
-
-        lines = []
-        if os.path.exists(db_file):
-            with open(db_file, "r") as f:
-                for line in f:
-                    if not line.startswith("E:"):
-                        lines.append(line)
-
-        for i in dict.items():
-            lines.append("E:%s=%s\n" % i)
-
-        with open(db_file, "w") as f:
-            for line in lines:
-                f.write(line)
-
         self.environment = dict
+
+        self.flush_db(db_file=db_file)
 
     @property
     def db_path(self):
@@ -453,88 +409,74 @@ class Device:
         """
         self.read_db(db_file=db_file)
 
-        if db_file is None:
-            db_file = self.db_path
-
         props = properties.upper()
         bprops = props.encode()
 
         if "E" in props:
             self.environment.clear()
         if "G" in props:
-            self.tags.clear()
+            old_tags = self.tags
+            self.tags = set()
 
-        lines = []
-        if os.path.exists(db_file):
-            with open(db_file, "rb") as f:
-                for line in f:
-                    if line[0] not in bprops:
-                        lines.append(line)
 
-        for line in buffer.splitlines(True):
+        for line in buffer.splitlines():
             if not line or line[0] not in bprops:
                 continue
-            elif line[0] in b'E' and b'=' in line:
-                k, v = line[2:-1].decode().split('=')
-                self.environment[k] = v
-                lines.append(line)
+
+            elif line[0] in b'E':
+                try:
+                    k, v = line[2:].decode().split('=')
+                except:
+                    logger.warn("Could not parse ENV entry %s" % line)
+                else:
+                    self.environment[k] = v
+
             elif line[0] in b'G':
-                self.tags.add(line[2:-1].decode())
-                lines.append(line)
+                self.tags.add(line[2:].decode())
+
             else:
                 logger.warn("Unknown sync type: %s" % chr(line[0]))
-        
-        with open(db_file, "wb") as f:
-            for line in lines:
-                f.write(line)
-            f.write(b'\n') # The sync buffer doesn't have the trailing \n
 
-    # The *_env_buffer methods operate directly on the udev database file.
-    # store_new_env_from_buffer therefore BREAKS ENVIROMENT SYNC!
-    def make_db_env_buffer(self, *, db_file=None, error_if_nonexistent=False):
+        self._add_tags(self.tags - old_tags)
+        self._del_tags(old_tags - self.tags)
+
+        self.flush_db(db_file=db_file)
+
+    def _add_tags(self, tags):
         """
-        Like read_db_env, but makes a bytestring with \0-separated KEY=VALUE pairs
+        Populate /run/udev/tags/<tag>/
+        Add new entries for this device
         """
-        if db_file is None:
-            db_file = self.db_path
+        id = self.get_id_filename()
+        if not id:
+            return
 
-        kvp = []
-        if os.path.exists(db_file):
-            with open(db_file, "rb") as f:
-                for line in f:
-                    if line.startswith(b"E:"):
-                        kvp.append(line[2:].rstrip(b"\n"))
-        elif error_if_nonexistent:
-            raise FileNotFoundError("%s: No such file or directory" % db_file)
-        return b'\0'.join(kvp)
+        for tag in tags:
+            tag_dir = os.path.join(RUNTIME_TAGS_PATH, tag)
+            tag_file = os.path.join(tag_dir, id)
+            os.makedirs(tag_dir, 0o755, True)
+            open(tag_file, "wb").close()
+            os.chmod(tag_file, 0o444)
 
-    def store_new_env_buffer(self, buffer, *, db_file=None):
+    def _del_tags(self, tags):
         """
-        store_new_env, but reads a make_db_env_buffer buffer
+        Populate /run/udev/tags/<tag>/
+        Remove old entries for this device
         """
-        if db_file is None:
-            id = self.get_id_filename()
-            if not id:
-                raise TypeError("get_id_filename() returned None and db_file wasn't given.")
-            db_file = os.path.join(RUNTIME_DATA_PATH, id)
+        id = self.get_id_filename()
+        if not id:
+            return
 
-        lines = []
-        if os.path.exists(db_file):
-            with open(db_file, "rb") as f:
-                for line in f:
-                    if not line.startswith(b"E:"):
-                        lines.append(line)
+        for tag in tags:
+            tag_dir = os.path.join(RUNTIME_TAGS_PATH, tag)
+            tag_file = os.path.join(tag_dir, id)
+            if os.path.exists(tag_file):
+                os.unlink(tag_file)
+            try:
+                os.rmdir(tag_dir)
+            except:
+                pass
 
-        if buffer:
-            for prop in buffer.split(b'\0'):
-                lines.append(b"E:" + prop + b'\n')
-
-        with open(db_file, "wb") as f:
-            for line in lines:
-                f.write(line)
-
-        # YOU REALLY SHOULD DISCARD THIS DEVICE INSTANCE AFTER CALLING THIS >.<
-        # If you insist on keeping this instace, at least call read_db(force=True).
 
     # Flush the current db state to disk
     # USE WITH CARE!
@@ -548,21 +490,15 @@ class Device:
                 raise TypeError("get_id_filename() returned None and db_file wasn't given.")
             db_file = os.path.join(RUNTIME_DATA_PATH, id)
 
-        lines = []
-        with open(db_file, "r") as fp:
-            for line in fp:
-                if line[0] not in "SEG":
-                    lines.append(line)
-
         with open(db_file, "w") as fp:
-            for line in lines:
-                fp.write(line)
             for devlink in self.devlinks:
                 fp.write("S:%s\n" % devlink)
             for env_entry in self.environment.items():
                 fp.write("E:%s=%s\n" % env_entry)
             for tag in self.tags:
                 fp.write("G:%s\n" % tag)
+            for line in self._db_unknown:
+                fp.write("%s\n" % line)
 
     # -------------------------------------------------------------------------
     # [/sys Attributes]
