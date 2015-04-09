@@ -46,7 +46,7 @@ class Device:
     __slots__ = ("syspath", "devpath", "sysname", "sysnum",
                  "devnum", "devnode", "devnode_mode", "devtype", "ifindex",
                  "id_filename", "subsystem", "environment",
-                 "properties", "sysattrs", "devlinks", "tags", "_db_unknown",
+                 "properties", "sysattrs", "devlinks", "tags", "_db_tags", "_db_unknown",
                  "is_uevent_loaded", "is_db_loaded", "is_initialized",
                  "__weakref__")
 
@@ -72,6 +72,7 @@ class Device:
         self.sysattrs = {}
         self.devlinks = set()
         self.tags = set()
+        self._db_tags = set()
         self._db_unknown = []
 
         self.is_uevent_loaded = False
@@ -343,6 +344,9 @@ class Device:
                 else:
                     self._db_unknown.append(line)
 
+        # We keep a copy of the current tags so we can update /run/udev/tags on flush_db()
+        self._db_tags = set(self.tags)
+
         #logger.info("Read udev db file for %s" % self.devpath)
 
     # To keep the environment in sync, all the store_*_env execute file transactions! (bottleneck!)
@@ -415,7 +419,6 @@ class Device:
         if "E" in props:
             self.environment.clear()
         if "G" in props:
-            old_tags = self.tags
             self.tags = set()
 
 
@@ -436,9 +439,6 @@ class Device:
 
             else:
                 logger.warn("Unknown sync type: %s" % chr(line[0]))
-
-        self._add_tags(self.tags - old_tags)
-        self._del_tags(old_tags - self.tags)
 
         self.flush_db(db_file=db_file)
 
@@ -479,11 +479,19 @@ class Device:
 
 
     # Flush the current db state to disk
-    # USE WITH CARE!
-    def flush_db(self, *, db_file=None):
+    def flush_db(self, *, db_file=None, update_tags=True):
         """
         Stores all environment entries, devlinks and tags in the udev database
+
+        also updates the /run/udev/tags entries
+
+        note that setting db_file implies update_tags=False
         """
+        if update_tags and db_file is None:
+            self._add_tags(self.tags - self._db_tags)
+            self._del_tags(self._db_tags - self.tags)
+            self._db_tags = set(self.tags)
+
         if db_file is None:
             id = self.get_id_filename()
             if not id:
