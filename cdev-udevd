@@ -395,7 +395,7 @@ def main(argv):
         logger.error("Requires root privileges.")
         return -errno.EPERM
 
-    logger.info("Starting cdev-udevd for container %s" % args.name)
+    logger.info("Starting cdev-udevd v%s for container %s" % (cdev.version_string, args.name))
 
     # Get control socket from systemd
     if args.systemd and os.getenv("LISTEN_PID", None) == str(os.getpid()):

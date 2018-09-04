@@ -370,7 +370,7 @@ def main(argv):
     # UGLY
     Client.crules_dir = args.container_rules_dir
 
-    logger.info("Starting cdevd v0.1 - (c) 2014 Taeyeon Mori")
+    logger.info("Starting cdevd v%s - (c) 2014-%s Taeyeon Mori" % (cdev.version_string, cdev.version_year))
     loop = asyncio.get_event_loop()
 
     # Handle systemd socket passing
