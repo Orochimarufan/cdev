@@ -204,9 +204,9 @@ def translate(expr: str) -> str:
     return p.finish()
 
 
-def compile(expr: str) -> re._pattern_type:
+def compile(expr: str) -> "re.Pattern":
     return re.compile(translate(expr))
 
-def match(string: str, expr: str) -> "match object":
+def match(string: str, expr: str) -> "re.Match":
     return re.match(translate(expr), string)
 

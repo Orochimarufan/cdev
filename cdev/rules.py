@@ -359,19 +359,19 @@ def op_subtract(assignment, context):   # -=
 op_equals = operator.eq                 # ===
 op_doesntequal = operator.ne            # !==
 
-def op_fnmatches(lvalue: str, rvalue: re._pattern_type) -> bool:        # ==
+def op_fnmatches(lvalue: str, rvalue: "re.Pattern") -> bool:        # ==
     return lvalue is not None and rvalue.match(lvalue) is not None
 op_fnmatches.compile = fnmatch.compile
 
-def op_doesntfnmatch(lvalue: str, rvalue: re._pattern_type) -> bool:    # !=
+def op_doesntfnmatch(lvalue: str, rvalue: "re.Pattern") -> bool:    # !=
     return lvalue is None or rvalue.match(lvalue) is None
 op_doesntfnmatch.compile = fnmatch.compile
 
-def op_rematches(lvalue: str, rvalue: re._pattern_type) -> bool:        # ~=
+def op_rematches(lvalue: str, rvalue: "re.Pattern") -> bool:        # ~=
     return lvalue is not None and rvalue.search(lvalue) is not None
 op_rematches.compile = re.compile
 
-def op_doesntrematch(lvalue: str, rvalue: re._pattern_type) -> bool:    # ~=
+def op_doesntrematch(lvalue: str, rvalue: "re.Pattern") -> bool:    # ~=
     return lvalue is None or rvalue.search(lvalue) is None
 op_doesntrematch.compile = re.compile
 
