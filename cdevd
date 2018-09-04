@@ -30,7 +30,7 @@ logger = logging.getLogger("cdev.cdevd")
 import cdev.protocol
 import cdev.device
 import cdev.netlink
-import cdev.async
+import cdev.asyncio
 import cdev.filter_rules
 import cdev.cgroups
 
@@ -92,9 +92,9 @@ class Client:
 
     def recv(self, timeout=None):
         if timeout is not None:
-            return cdev.async.recv_message_timeout(self.reader, timeout)
+            return cdev.asyncio.recv_message_timeout(self.reader, timeout)
         else:
-            return cdev.async.recv_message(self.reader)
+            return cdev.asyncio.recv_message(self.reader)
 
     def initialize_client(self, name):
         """
@@ -316,7 +316,7 @@ def handle_uevents(uevent_channel=cdev.netlink.UDEV_NETLINK_UDEV):
 
     while True:
         # listen for new event
-        data, ancdata, flags, addr = yield from cdev.async.sock_recvmsg(sock, 2048, 512)
+        data, ancdata, flags, addr = yield from cdev.asyncio.sock_recvmsg(sock, 2048, 512)
 
         # Parse event and create device object
         is_libudev_message = data[:8] == cdev.netlink.udev_netlink_header_prefix
@@ -398,7 +398,7 @@ def main(argv):
 
     # Listen for uevents on NETLINK
     logger.info("Listening to events on NETLINK_KOBJECT_UEVENT/UDEV_NETLINK_" + ("KERNEL" if args.kernel_events else "UDEV"))
-    asyncio.async(handle_uevents(cdev.netlink.UDEV_NETLINK_KERNEL if args.kernel_events else cdev.netlink.UDEV_NETLINK_UDEV))
+    asyncio.ensure_future(handle_uevents(cdev.netlink.UDEV_NETLINK_KERNEL if args.kernel_events else cdev.netlink.UDEV_NETLINK_UDEV))
 
     # make sure to clean up the socket!
     try:
@@ -406,10 +406,10 @@ def main(argv):
         # pick up our previous work on socket activation
         if sock is not None:
             logger.info("Listening for connections on unix+fd://3 (probably at %s)" % args.socket_path)
-            serv_t = asyncio.async(asyncio.start_unix_server(Client, sock=sock))
+            serv_t = asyncio.ensure_future(asyncio.start_unix_server(Client, sock=sock))
         else:
             logger.info("Listening to connections on unix://%s" % args.socket_path)
-            serv_t = asyncio.async(asyncio.start_unix_server(Client, args.socket_path))
+            serv_t = asyncio.ensure_future(asyncio.start_unix_server(Client, args.socket_path))
         loop.run_until_complete(serv_t)
 
         # Run until something breaks :)

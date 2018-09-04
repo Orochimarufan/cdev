@@ -26,7 +26,7 @@ import os
 import errno
 import asyncio
 import logging
-from . import async
+from . import asyncio as cdev_asyncio
 from . import struct
 from . import socket
 from .device import RUNTIME_PATH
@@ -138,7 +138,7 @@ class UdevControlConnection:
 
     @asyncio.coroutine
     def recv(self):
-        data, ancdata, flags, addr = (yield from async.sock_recvmsg(self.sock, UdevControlMessage.size, socket.CMSG_SPACE(socket.ucred.size)))
+        data, ancdata, flags, addr = (yield from cdev_asyncio.sock_recvmsg(self.sock, UdevControlMessage.size, socket.CMSG_SPACE(socket.ucred.size)))
 
         #if not ancdata or ancdata[0][1] != socket.SCM_CREDENTIALS:
         #    logger.error("no sender credentials received, message ignored")
@@ -237,7 +237,8 @@ class UdevControl:
             conn = (yield from self.accept())
 
             if conn is not None:
-                asyncio.async(conn.run())
+#                asyncio.async(conn.run())
+                asyncio.ensure_future(conn.run())
 
         if self.cleanup_socket:
             self.sock.close()

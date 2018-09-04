@@ -33,7 +33,7 @@ logger = logging.getLogger("cdev.udevd")
 from cdev import protocol as proto
 import cdev.device
 import cdev.netlink
-import cdev.async
+import cdev.asyncio
 import cdev.client_rules
 import cdev.udevcontrol
 
@@ -100,9 +100,9 @@ class CdevUdevd:
 
     def recv(self, timeout=None):
         if timeout is not None:
-            return cdev.async.recv_message_timeout(self.reader, timeout)
+            return cdev.asyncio.recv_message_timeout(self.reader, timeout)
         else:
-            return cdev.async.recv_message(self.reader)
+            return cdev.asyncio.recv_message(self.reader)
 
     def load_rules(self):
         self.rules = load_rules(self.options.rules_dir)
